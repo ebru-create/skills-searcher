@@ -83,35 +83,64 @@ export function parseFindOptions(args: string[]): ParseFindOptionsResult {
   return { query: queryParts.join(' '), options, errors };
 }
 
-// Search via API
-export async function searchSkillsAPI(query: string, owner?: string): Promise<SearchSkill[]> {
+class SearchError extends Error {}
+
+// Search failures must remain distinct from a successful search with no matches.
+export async function searchSkillsAPI(
+  query: string,
+  owner?: string,
+  signal?: AbortSignal
+): Promise<SearchSkill[]> {
+  const timeout = AbortSignal.timeout(10_000);
   try {
     const params = new URLSearchParams({ q: query, limit: SEARCH_RESULT_LIMIT });
     if (owner) params.set('owner', owner);
     const url = `${SEARCH_API_BASE}/api/search?${params.toString()}`;
-    const res = await fetch(url);
+    const res = await fetch(url, {
+      signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+    });
 
-    if (!res.ok) return [];
+    if (!res.ok) {
+      throw new SearchError(`Search service returned HTTP ${res.status}. Please try again.`);
+    }
 
-    const data = (await res.json()) as {
-      skills: Array<{
-        id: string;
-        name: string;
-        installs: number;
-        source: string;
-      }>;
-    };
+    let data: unknown;
+    try {
+      data = await res.json();
+    } catch {
+      throw new SearchError('Search service returned an invalid response. Please try again.');
+    }
+    if (!data || typeof data !== 'object' || !('skills' in data) || !Array.isArray(data.skills)) {
+      throw new SearchError('Search service returned an invalid response. Please try again.');
+    }
 
-    return data.skills
-      .map((skill) => ({
-        name: sanitizeMetadata(skill.name),
-        slug: sanitizeMetadata(skill.id),
-        source: sanitizeMetadata(skill.source || ''),
-        installs: skill.installs,
-      }))
-      .sort((a, b) => (b.installs || 0) - (a.installs || 0));
-  } catch {
-    return [];
+    const results: SearchSkill[] = [];
+    for (const entry of data.skills) {
+      if (!entry || typeof entry !== 'object') continue;
+      const { name, id, source, installs } = entry;
+      if (typeof name !== 'string' || typeof id !== 'string') continue;
+      const cleanName = sanitizeMetadata(name);
+      const slug = sanitizeMetadata(id);
+      if (!cleanName || !slug) continue;
+      results.push({
+        name: cleanName,
+        slug,
+        source: typeof source === 'string' ? sanitizeMetadata(source) : '',
+        installs:
+          typeof installs === 'number' && Number.isFinite(installs) && installs > 0 ? installs : 0,
+      });
+    }
+    if (data.skills.length > 0 && results.length === 0) {
+      throw new SearchError('Search service returned invalid results. Please try again.');
+    }
+    return results.sort((a, b) => b.installs - a.installs);
+  } catch (error) {
+    if (signal?.aborted) throw signal.reason;
+    if (timeout.aborted) {
+      throw new SearchError('Search timed out. Please try again.');
+    }
+    if (error instanceof SearchError) throw error;
+    throw new SearchError('Could not reach the search service. Please try again.');
   }
 }
 
@@ -123,13 +152,20 @@ const MOVE_UP = (n: number) => `\x1b[${n}A`;
 const MOVE_TO_COL = (n: number) => `\x1b[${n}G`;
 
 // Custom fzf-style search prompt using raw readline
-async function runSearchPrompt(initialQuery = '', owner?: string): Promise<SearchSkill | null> {
+export async function runSearchPrompt(
+  initialQuery = '',
+  owner?: string
+): Promise<SearchSkill | null> {
   let results: SearchSkill[] = [];
   let selectedIndex = 0;
   let query = initialQuery;
   let loading = false;
   let debounceTimer: ReturnType<typeof setTimeout> | null = null;
   let lastRenderedLines = 0;
+  let requestId = 0;
+  let controller: AbortController | null = null;
+  let closed = false;
+  let searchError = '';
 
   // Enable raw mode for keypress events
   if (process.stdin.isTTY) {
@@ -146,6 +182,7 @@ async function runSearchPrompt(initialQuery = '', owner?: string): Promise<Searc
   process.stdout.write(HIDE_CURSOR);
 
   function render(): void {
+    if (closed) return;
     // Move cursor up to overwrite previous render
     if (lastRenderedLines > 0) {
       process.stdout.write(MOVE_UP(lastRenderedLines) + MOVE_TO_COL(1));
@@ -161,20 +198,23 @@ async function runSearchPrompt(initialQuery = '', owner?: string): Promise<Searc
     lines.push(`${TEXT}Search skills:${RESET} ${query}${cursor}`);
     lines.push('');
 
-    // Results - keep showing existing results while loading new ones
+    // Render only results belonging to the current query.
     if (!query || query.length < 2) {
       lines.push(`${DIM}Start typing to search (min 2 chars)${RESET}`);
+    } else if (searchError) {
+      lines.push(`${YELLOW}${searchError}${RESET}`);
     } else if (results.length === 0 && loading) {
       lines.push(`${DIM}Searching…${RESET}`);
     } else if (results.length === 0) {
       lines.push(`${DIM}No skills found${RESET}`);
     } else {
       const maxVisible = 8;
-      const visible = results.slice(0, maxVisible);
+      const start = Math.max(0, selectedIndex - maxVisible + 1);
+      const visible = results.slice(start, start + maxVisible);
 
       for (let i = 0; i < visible.length; i++) {
         const skill = visible[i]!;
-        const isSelected = i === selectedIndex;
+        const isSelected = start + i === selectedIndex;
         const arrow = isSelected ? `${BOLD}>${RESET}` : ' ';
         const name = isSelected ? `${BOLD}${skill.name}${RESET}` : `${TEXT}${skill.name}${RESET}`;
         const source = skill.source ? ` ${DIM}${skill.source}${RESET}` : '';
@@ -186,6 +226,9 @@ async function runSearchPrompt(initialQuery = '', owner?: string): Promise<Searc
       }
     }
 
+    if (results.length > 0) {
+      lines.push(`${DIM}${selectedIndex + 1} of ${results.length}${RESET}`);
+    }
     lines.push('');
     lines.push(`${DIM}up/down navigate | enter select | esc cancel${RESET}`);
 
@@ -198,6 +241,12 @@ async function runSearchPrompt(initialQuery = '', owner?: string): Promise<Searc
   }
 
   function triggerSearch(q: string): void {
+    const id = ++requestId;
+    controller?.abort();
+    controller = null;
+    searchError = '';
+    results = [];
+    selectedIndex = 0;
     // Always clear any pending debounce timer
     if (debounceTimer) {
       clearTimeout(debounceTimer);
@@ -223,15 +272,24 @@ async function runSearchPrompt(initialQuery = '', owner?: string): Promise<Searc
     const debounceMs = Math.max(150, 350 - q.length * 50);
 
     debounceTimer = setTimeout(async () => {
+      debounceTimer = null;
+      const activeController = new AbortController();
+      controller = activeController;
       try {
-        results = await searchSkillsAPI(q, owner);
+        const found = await searchSkillsAPI(q, owner, activeController.signal);
+        if (closed || id !== requestId) return;
+        results = found;
         selectedIndex = 0;
-      } catch {
+      } catch (error) {
+        if (closed || id !== requestId) return;
         results = [];
+        searchError = error instanceof Error ? error.message : 'Search failed. Please try again.';
       } finally {
-        loading = false;
-        debounceTimer = null;
-        render();
+        if (!closed && id === requestId) {
+          controller = null;
+          loading = false;
+          render();
+        }
       }
     }, debounceMs);
   }
@@ -244,6 +302,12 @@ async function runSearchPrompt(initialQuery = '', owner?: string): Promise<Searc
 
   return new Promise((resolve) => {
     function cleanup(): void {
+      closed = true;
+      requestId++;
+      if (debounceTimer) clearTimeout(debounceTimer);
+      debounceTimer = null;
+      controller?.abort();
+      controller = null;
       process.stdin.removeListener('keypress', handleKeypress);
       if (process.stdin.isTTY) {
         process.stdin.setRawMode(false);
@@ -264,6 +328,7 @@ async function runSearchPrompt(initialQuery = '', owner?: string): Promise<Searc
       }
 
       if (key.name === 'return') {
+        if (loading || searchError || results.length === 0) return;
         // Submit
         cleanup();
         resolve(results[selectedIndex] || null);
@@ -334,12 +399,20 @@ ${DIM}  2) npx skills add <owner/repo@skill>${RESET}`;
   if (errors.length > 0) {
     for (const error of errors) console.error(error);
     console.error('Usage: npx skills find <query> [--owner <owner>]');
+    process.exitCode = 1;
     return;
   }
 
   // Non-interactive mode: just print results and exit
   if (query) {
-    const results = await searchSkillsAPI(query, owner);
+    let results: SearchSkill[];
+    try {
+      results = await searchSkillsAPI(query, owner);
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : 'Search failed. Please try again.');
+      process.exitCode = 1;
+      return;
+    }
 
     // Track telemetry for non-interactive search
     track({
